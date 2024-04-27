@@ -1,0 +1,342 @@
+---
+title: "01_exploratory_data_analysis"
+author: "Nguyen Trung Nam"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+LOAD LIBRARY & USER-DEFINED FUNCTIONS
+```{r Library, echo=FALSE}
+library(data.table)
+library(tidyverse)
+library(raster)
+library(rgdal)
+library(sf)
+library(readr)
+library(lubridate)
+library(zoo)
+library(forcats)
+library(corrr)
+library(cowplot)
+library(fitdistrplus)
+library(xts)
+library(qmap)
+library(car)
+source("d:/Repository/R_Postgres/R/F-R_conect_DB.R")
+source("d:/Repository/Mike11model/R/f-TL_DBSCL_model.R")
+source("d:/Repository/R_Postgres/R/Thongso_chung_vebieudo.R")
+source("d:/Repository/R_Postgres/R/F-summary.R")
+source("d:/Repository/R_Postgres/R/F-fixExten_areaClassify_raster.R")
+# Phần chỉnh thông số chung - size & font-----
+legsize     = 26  # Kích thước chữ legend
+axisize     = 24  # Kích thước chữ của trục
+axtilesize  = 22  # Kích thước chữ chú dẫn trục axis
+tilesize    = 28  # Kích thước tên biểu đồ
+legspace    = 1 # Khoảng cách các thành phần trong legend
+fcetsize    = 22  # Kích thước chữ trong facet title
+mary        = 2  # Khoảng cách axis title và axis trục y
+marx        = 2  # Khoảng cách axis title và axis trục x
+antext      =  5  # Kích thước size text của annotation
+ansym       =  6  # Kích thước segment của legend
+```
+
+# 01:PREPARE GLOBAL REANALYZED PRECIPITATION
+Aims:
+-> To extract reanalyzed rainfall which provided by NOAA at given stations
+-> To pre-assess observed precipitation data of these stations
+```{r}
+# extract the precipitation data-----
+path_nc      <- "d:/Repository/R_Postgres/rawdata/ncdf/"
+path_shp     <- "d:/Trung Nam/SIWRP/Nam/Dubaolu_dautieng_2023/04_Gis/data/"
+sta_loca     <- st_read(paste0(path_shp,"trammua_lvdautieng_latlon.shp")) %>%
+                as.data.frame()
+sta_list     <- sta_loca %>% mutate(no = row_number()) %>% dplyr::select(no,sta) %>%
+                mutate(station_id = sta, sta = NULL)
+
+sta_loca     <- sta_loca %>% mutate(longitute  = unlist(map(sta_loca$geometry,1)),
+                                    latitute   = unlist(map(sta_loca$geometry,2)))
+sta_loca     <- sta_loca %>% dplyr::select(longitute,latitute)
+## for loop to extract rainfall 
+dt    <- as.numeric()
+files <- list.files(paste0(path_nc),pattern = ".nc")
+for (i in 1:length(files))
+{
+  ncd_r <- brick(paste0(path_nc,files[i]))
+  df    <- raster::extract(ncd_r,sta_loca,method="bilinear")
+  df    <- as.data.frame(df)
+  df    <- t(df) %>% as.data.frame()
+  df    <- df %>% tibble::rownames_to_column()
+  df    <- gather(df,no,value,-rowname)
+  df    <- separate(df,rowname, into = c('y','m','d','xb1','xb2','xb3','xb4'), sep = '\\.')
+  df    <- df %>% dplyr::select(y,m,d,no,value)
+  df    <- df %>% mutate(y  = gsub(pattern = "X",'',y),
+                         no = gsub(pattern = "V",'',no),
+                         across(c(y,m,d,no), as.numeric))
+  dt    <- rbind(df,dt)
+}
+## join to get station name
+df_th <- left_join(dt, sta_list, by = 'no') %>% fdate()
+df_th <- df_th %>% dplyr::select(y,m,d,date,station_id,value)
+df_th <- spread(df_th,station_id,value)
+write.csv(df_th, file = 'Noaa_rain_trammuaDT.csv',sep = ',',row.names = F)
+
+# quickly assess statistical basic----
+precip_data <- read_csv("d:/Repository/ML_SelfStudy_FldForecast/Noaa_rain_trammuaDT.csv")
+precip_data <- gather(precip_data,station_id,rainfall,-d,-m,-y,-date)
+
+# Aggregate daily data into annual total rainfall
+annual_rainfall <- precip_data %>%
+  group_by(y,station_id) %>%
+  summarise(total_annual_rainfall = sum(rainfall, na.rm = TRUE)) %>% ungroup()
+# Plot annual rainfall boxplot
+ggplot(annual_rainfall, aes(x = station_id, y = total_annual_rainfall)) +
+  geom_boxplot() +
+  labs(title = "Annual Rainfall Boxplot", x = "Year", y = "Total Annual Rainfall (mm)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Aggregate daily data into monthly total rainfall (across all years)
+monthly_rainfall <- precip_data %>%
+  group_by(m,station_id) %>%
+  summarise(total_monthly_rainfall = sum(rainfall, na.rm = TRUE))
+
+# Plot monthly rainfall boxplot
+ggplot(monthly_rainfall, aes(x = factor(m, labels = c('Jan', 'Feb', 'Mar', 'Apr',
+                                                          'May', 'Jun', 'Jul', 'Aug',
+                                                          'Sep', 'Oct', 'Nov', 'Dec')), 
+                             y = total_monthly_rainfall)) +
+  geom_boxplot() +
+  labs(title = "Monthly Rainfall Boxplot", x = "Month", y = "Total Monthly Rainfall (mm)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# 02:BIAS CORRECTION USING QMAP PACKAGE
+Aims:
+-> To familiarize my self with functions in the Qmap package
+-> Sample data: 
+                + Selection stations: Tay Ninh, Loc Ninh
+                + Calibration period: 1991 - 2000
+                + Validation period: 2001 - 2021
+```{r}
+# data preparation -----
+obsprecip      <- read_excel("d:/Repository/ML_SelfStudy_FldForecast/rawdata/obs_precip_flow_dtbasin.xlsx",
+                             sheet = "rain")
+obsprecip      <- obsprecip %>% mutate(across(-date,as.numeric))
+## retrieve obs rainfall data for calibration
+obsprecip      <- obsprecip %>% dplyr::select(date,tayninh,locninh) %>% 
+                       mutate(yr = year(date)) 
+obspre_train   <- obsprecip %>% mutate(y = year(date),m = month(date), d = day(date)) %>%
+                    fdate() %>% filter(yr > 1990, yr < 2001) %>% dplyr::select(date,tayninh,locninh) 
+obspre_test    <- obsprecip %>% mutate(y = year(date),m = month(date), d = day(date)) %>%
+                    fdate() %>% filter(yr > 2001, yr < 2019) %>% dplyr::select(date,tayninh,locninh) 
+write.csv(obspre_test,file  = "xb_obs_test.csv", sep = ",", row.names = F)
+## convert to an xts object
+obspre_train   <- xts(x = obspre_train[, -which(names(obspre_train) == "date")], order.by = obspre_train$date)
+obspre_test    <- xts(x = obspre_test[, -which(names(obspre_test) == "date")], order.by = obspre_test$date)
+
+# modeled precipitation
+simprecip      <- read_csv("d:/Repository/ML_SelfStudy_FldForecast/rawdata/precip_dtbasin_noaa.csv")
+## retrieve noaa rainfall data for calibration
+simpre_train   <- simprecip %>% dplyr::select(y,m,d,tayninh,locninh) %>%
+                  filter(y > 1990, y < 2001) %>% fdate() 
+simpre_test    <- simprecip %>% dplyr::select(y,m,d,tayninh,locninh) %>%
+                  filter(y > 2001,y < 2019) %>% fdate() 
+write.csv(simpre_test,file  = "xb_sim_test.csv", sep = ",", row.names = F)
+## convert to an xts object
+simpre_train   <- xts(x = simpre_train[, -which(names(simpre_train) == "date")], order.by = simpre_train$date)
+simpre_test    <- xts(x = simpre_test[, -which(names(simpre_test) == "date")], order.by = simpre_test$date)
+
+## retrieve vectors
+obs_train     <- as.vector(obspre_train$tayninh) 
+obs_train     <- obs_train[obs_train > 0] %>% na.omit()
+
+sim_train     <- as.vector(simpre_train$tayninh) 
+sim_train     <- sim_train[sim_train > 0] %>% na.omit()
+## extracting test data
+obs_test     <- as.vector(obspre_test$tayninh)%>% na.omit()
+sim_test     <- as.vector(simpre_test$tayninh)%>% na.omit()
+
+# testing parametric transformation-------
+fit_ptf   <- fitQmapPTF(obs_train,sim_train, transfun = "expasympt.x0",
+                       cost = "MAE")
+pre_fixed <- doQmapPTF(sim_test,fit_ptf)
+
+## assessing changes in monthly or yearly precipitation amount
+dt_test    <- data.frame(sim   = sim_test,
+                         fixe  = pre_fixed,
+                         obs   = obs_test,
+                         y     = simpre_test$y,
+                         m     = simpre_test$m,
+                         d     = simpre_test$d)
+dt_y      <-  gather(dt_test,type_id,value, - y, -m, -d)
+dt_y      <-  dt_y %>% group_by(y,type_id) %>% mutate(value = sum(value)) %>% ungroup() %>%
+            dplyr::select(y,type_id,value) %>% distinct()
+dt_y      <- spread(dt_y,type_id, value)
+write.csv(dt_y, file = "xb_parametric_corrected.csv", sep = ",", row.names = F)
+
+
+# model performance
+## Root Mean Squared Error (RMSE)
+rmse <- sqrt(mean((pre_fixed - obs_test)^2))
+cat("RMSE_corrected:", rmse, "\n")
+rmse <- sqrt(mean((sim_test - obs_test)^2))
+cat("RMSE_none:", rmse, "\n")
+# Mean Absolute Error (MAE)
+mae <- mean(abs(pre_fixed - obs_test))
+cat("MAE_corrected:", mae, "\n")
+mae <- mean(abs(sim_test - obs_test))
+cat("MAE_none:", mae, "\n")
+
+# Pearson Correlation Coefficient (R)
+correlation <- cor(pre_fixed, obs_test)
+cat("R_corrected:", correlation, "\n")
+correlation <- cor(sim_test, obs_test)
+cat("R_none:", correlation, "\n")
+
+# Visual comparison
+plot(obs_test, pre_fixed, main="Observed vs Corrected Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Corrected Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+plot(obs_test, sim_test, main="Observed vs Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+
+# testing Quantile mapping using distribution derived transformations-------
+fit_dist   <- fitQmapDIST(obs_train,sim_train)
+pre_fixed <- doQmapPTF(sim_test,fit_dist)
+
+# model performance
+## Root Mean Squared Error (RMSE)
+rmse <- sqrt(mean((pre_fixed - obs_test)^2))
+cat("RMSE_corrected:", rmse, "\n")
+rmse <- sqrt(mean((sim_test - obs_test)^2))
+cat("RMSE_none:", rmse, "\n")
+# Mean Absolute Error (MAE)
+mae <- mean(abs(pre_fixed - obs_test))
+cat("MAE_corrected:", mae, "\n")
+mae <- mean(abs(sim_test - obs_test))
+cat("MAE_none:", mae, "\n")
+
+# Pearson Correlation Coefficient (R)
+correlation <- cor(pre_fixed, obs_test)
+cat("R_corrected:", correlation, "\n")
+correlation <- cor(sim_test, obs_test)
+cat("R_none:", correlation, "\n")
+
+# Visual comparison
+plot(obs_test, pre_fixed, main="Observed vs Corrected Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Corrected Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+plot(obs_test, sim_test, main="Observed vs Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+# testing smoothing splines-------
+fit_dist   <- fitQmapSSPLIN(obs_train,sim_train)
+pre_fixed  <- doQmapSSPLIN(sim_test,fit_dist)
+
+## assessing changes in monthly or yearly precipitation amount
+dt_test    <- data.frame(sim   = sim_test,
+                         fixe  = pre_fixed,
+                         obs   = obs_test,
+                         y     = simpre_test$y,
+                         m     = simpre_test$m,
+                         d     = simpre_test$d)
+dt_y      <-  gather(dt_test,type_id,value, - y, -m, -d)
+dt_y      <-  dt_y %>% group_by(y,type_id) %>% mutate(value = sum(value)) %>% ungroup() %>%
+            dplyr::select(y,type_id,value) %>% distinct()
+dt_y      <- spread(dt_y,type_id, value)
+write.csv(dt_y, file = "xb_splines_corrected.csv", sep = ",", row.names = F)
+
+
+# model performance
+## Root Mean Squared Error (RMSE)
+rmse <- sqrt(mean((pre_fixed - obs_test)^2))
+cat("RMSE_corrected:", rmse, "\n")
+rmse <- sqrt(mean((sim_test - obs_test)^2))
+cat("RMSE_none:", rmse, "\n")
+# Mean Absolute Error (MAE)
+mae <- mean(abs(pre_fixed - obs_test))
+cat("MAE_corrected:", mae, "\n")
+mae <- mean(abs(sim_test - obs_test))
+cat("MAE_none:", mae, "\n")
+
+# Pearson Correlation Coefficient (R)
+correlation <- cor(pre_fixed, obs_test)
+cat("R_corrected:", correlation, "\n")
+correlation <- cor(sim_test, obs_test)
+cat("R_none:", correlation, "\n")
+
+# Visual comparison
+plot(obs_test, pre_fixed, main="Observed vs Corrected Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Corrected Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+plot(obs_test, sim_test, main="Observed vs Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+
+# testing non_parmater transformations-------
+fit_dist   <- fitQmapQUANT(obs_train,sim_train)
+pre_fixed  <- doQmapQUANT(sim_test,fit_dist)
+
+## assessing changes in monthly or yearly precipitation amount
+dt_test    <- data.frame(sim   = sim_test,
+                         fixe  = pre_fixed,
+                         obs   = obs_test,
+                         y     = simpre_test$y,
+                         m     = simpre_test$m,
+                         d     = simpre_test$d)
+dt_y      <-  gather(dt_test,type_id,value, - y, -m, -d)
+dt_y      <-  dt_y %>% group_by(y,type_id) %>% mutate(value = sum(value)) %>% ungroup() %>%
+            dplyr::select(y,type_id,value) %>% distinct()
+dt_y      <- spread(dt_y,type_id, value)
+write.csv(dt_y, file = "xb_nonparameter_corrected.csv", sep = ",", row.names = F)
+
+
+
+# model performance
+## Root Mean Squared Error (RMSE)
+rmse <- sqrt(mean((pre_fixed - obs_test)^2))
+cat("RMSE_corrected:", rmse, "\n")
+rmse <- sqrt(mean((sim_test - obs_test)^2))
+cat("RMSE_none:", rmse, "\n")
+# Mean Absolute Error (MAE)
+mae <- mean(abs(pre_fixed - obs_test))
+cat("MAE_corrected:", mae, "\n")
+mae <- mean(abs(sim_test - obs_test))
+cat("MAE_none:", mae, "\n")
+
+# Pearson Correlation Coefficient (R)
+correlation <- cor(pre_fixed, obs_test)
+cat("R_corrected:", correlation, "\n")
+correlation <- cor(sim_test, obs_test)
+cat("R_none:", correlation, "\n")
+
+# Visual comparison
+plot(obs_test, pre_fixed, main="Observed vs Corrected Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Corrected Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+plot(obs_test, sim_test, main="Observed vs Simulated Precipitation",
+     xlab="Observed Precipitation", ylab="Simulated Precipitation",
+     pch=19, col="blue")
+abline(0, 1, col="red") # Line of perfect agreement
+
+
+
+

@@ -1,0 +1,49 @@
+---
+title: "ML Knowledge Base"
+author: "Nguyen Trung Nam"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    number_sections: true
+zoreto: True 
+editor: 
+  mode: source
+bibliography: references.bib
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+I'm a newcomer to the machine learning. Here is a first step in embarking on an exploratory journey to apply its principles and methods into my works.This document shows my reflection of my understanding of machine learning. The content is represented in both English and Vietnamese, with the Vietnamese appearing in italicized text.
+
+# Overview
+
+# Machine learning model development and model operations
+
+## Brief introduction
+Machine Learning has been significantly employed in numerous fields, thereby making it
+crucial to have a management framework that consists of key steps in ML applications, 
+including building, testing, deploying, maintaining and scoring ML model. In general, 
+the ML application is divided into two parts, such as ML model development and ML model 
+maintenance. In particular, ML model development comprises four steps: exploratory data
+analysis, building ML models, tuning model parameters and choosing an ML optimum model.
+Meanwhile, ML model maintenance involves keeping the model up to date and ensuring it
+remains relevant as source data changes.
+
+## Practices[@li2022a]
+
+# Machine learning projects in R: Best practices and Tips
+
+## Machine learning libraries
+
+## Recommended Workflow
+
+<https://rstudio.github.io/visual-markdown-editing/markdown.html>
+
+# References
+
+
+https://www.sciencedirect.com/science/article/pii/S2405880717300079?via%3Dihub

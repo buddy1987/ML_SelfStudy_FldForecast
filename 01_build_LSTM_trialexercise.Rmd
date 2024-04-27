@@ -1,0 +1,118 @@
+---
+title: "01_exploratory_data_analysis"
+author: "Nguyen Trung Nam"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+LOAD LIBRARY & USER-DEFINED FUNCTIONS
+```{r Library, echo=FALSE}
+library(data.table)
+library(tidyverse)
+library(raster)
+library(rgdal)
+library(sf)
+library(readr)
+library(lubridate)
+library(zoo)
+library(forcats)
+library(corrr)
+library(cowplot)
+library(fitdistrplus)
+library(xts)
+library(qmap)
+library(car)
+library(keras)
+library(tensorflow)
+library(reticulate)
+use_condaenv("env4r", required = TRUE)
+source("d:/Repository/R_Postgres/R/F-R_conect_DB.R")
+source("d:/Repository/Mike11model/R/f-TL_DBSCL_model.R")
+source("d:/Repository/R_Postgres/R/Thongso_chung_vebieudo.R")
+source("d:/Repository/R_Postgres/R/F-summary.R")
+source("d:/Repository/R_Postgres/R/F-fixExten_areaClassify_raster.R")
+# Phần chỉnh thông số chung - size & font-----
+legsize     = 26  # Kích thước chữ legend
+axisize     = 24  # Kích thước chữ của trục
+axtilesize  = 22  # Kích thước chữ chú dẫn trục axis
+tilesize    = 28  # Kích thước tên biểu đồ
+legspace    = 1 # Khoảng cách các thành phần trong legend
+fcetsize    = 22  # Kích thước chữ trong facet title
+mary        = 2  # Khoảng cách axis title và axis trục y
+marx        = 2  # Khoảng cách axis title và axis trục x
+antext      =  5  # Kích thước size text của annotation
+ansym       =  6  # Kích thước segment của legend
+```
+
+# 01:EXAMPLE EXERCISE FOR BUILD LSTM MODEL
+Aims:
+-> To extract reanalyzed rainfall which provided by NOAA at given stations
+-> To pre-assess observed precipitation data of these stations
+```{r}
+# Load and Preprocess the Data----
+data <- read_excel("d:/Repository/ML_SelfStudy_FldForecast/rawdata/obs_precip_flow_dtbasin.xlsx",
+                   sheet = "trialtest")
+data$date <- as.Date(data$date, format = "%Y-%m-%d") # Adjust format as needed
+# Normalize the data----
+max_flow <- max(data$inflow)
+min_flow <- min(data$inflow)
+data$Scaled_Flow <- (data$inflow - min_flow) / (max_flow - min_flow)
+
+# Create sequence-----
+sequence_length <- 5
+
+generate_sequences <- function(data, length) {
+  X <- list()
+  y <- list()
+  for (i in 1:(nrow(data) - length)) {
+    X[[i]] <- data$Scaled_Flow[i:(i + length - 1)]
+    y[[i]] <- data$Scaled_Flow[i + length]
+  }
+  # Convert lists to arrays
+  X_array <- array(unlist(X), dim = c(length(X), length, 1))
+  y_array <- unlist(y)
+  return(list(X = X_array, y = y_array))
+}
+sequences <- generate_sequences(data, sequence_length)
+
+# Split the data into training and validation -----
+# Let's ensure the train_index is computed and used correctly
+train_index <- max(which(year(data$date) < 2022)) # Take maximum index that corresponds to the year 2020
+
+# Use this index to correctly allocate training and validation data
+X_train <- sequences$X[1:train_index, ,]
+y_train <- sequences$y[1:train_index]
+X_val   <- sequences$X[(train_index + 1):length(sequences$y), ,]
+y_val   <- sequences$y[(train_index + 1):length(sequences$y)]
+
+
+# Build LSTM model-----
+model <- keras_model_sequential() %>%
+  layer_lstm(units = 50, input_shape = c(sequence_length, 1), return_sequences = TRUE) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_lstm(units = 50, return_sequences = FALSE) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 1)
+
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'mean_squared_error'
+)
+
+# Train the model -----
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 200,
+  batch_size = 32,
+  validation_data = list(X_val, y_val)
+)
+
+# Predict the flow for 2021
+predictions    <- model %>% predict(X_val)
+predicted_flow <- predictions * (max_flow - min_flow) + min_flow
+write.csv(predicted_flow, file = "xb_predic.csv", sep = ",", row.names = F)
+
+```
+
